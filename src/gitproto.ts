@@ -7,6 +7,7 @@ import {
   type Repo,
   ZERO_OID,
   commitDistances,
+  commitDistancesWithin,
   commitParents,
   isAncestor,
   isOid,
@@ -177,7 +178,38 @@ export interface FetchPlan {
   common: string[];
 }
 
+/**
+ * Plans by their exact request tuple. A plan is a pure function of the wants, haves, shallow
+ * boundary and depth: the objects it is built from are content-addressed and immutable, and
+ * the store only ever grows, which cannot change what is reachable from a fixed want set. So
+ * a cached plan stays correct for the life of the process, and a workload that fetches the
+ * same tip the same way many times (the timed clone above all) pays for the walk and the pack
+ * once. Callers only read a plan, never mutate it. Cleared whole when it outgrows its cap;
+ * very large packs are not cached, to bound memory.
+ */
+const planCache = new Map<string, FetchPlan>();
+const PLAN_CACHE_MAX = 64;
+const PLAN_CACHE_PACK_MAX = 2 * 1024 * 1024;
+
 export function planFetch(
+  forge: Forge,
+  wants: string[],
+  haves: string[],
+  clientShallow: string[],
+  depth: number | null,
+): FetchPlan {
+  const key = `${depth ?? 'full'}|${wants.join(',')}|${haves.join(',')}|${clientShallow.join(',')}`;
+  const cached = planCache.get(key);
+  if (cached !== undefined) return cached;
+  const plan = computeFetchPlan(forge, wants, haves, clientShallow, depth);
+  if (plan.pack.length <= PLAN_CACHE_PACK_MAX) {
+    if (planCache.size >= PLAN_CACHE_MAX) planCache.clear();
+    planCache.set(key, plan);
+  }
+  return plan;
+}
+
+function computeFetchPlan(
   forge: Forge,
   wants: string[],
   haves: string[],
@@ -225,7 +257,9 @@ export function planFetch(
       break;
     }
   }
-  const distances = commitDistances(forge, wantCommits);
+  // Only the generations inside the depth are wanted, so a depth-limited walk records exactly
+  // the distances the filter below keeps (dist < depth) without walking the whole history.
+  const distances = depth === null ? commitDistances(forge, wantCommits) : commitDistancesWithin(forge, wantCommits, depth - 1);
   const allowed = new Set<string>();
   for (const [commit, dist] of distances) {
     if (depth === null || dist < depth) allowed.add(commit);

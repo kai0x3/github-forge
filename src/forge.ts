@@ -362,6 +362,34 @@ export function commitDistances(forge: Forge, tips: readonly string[]): Map<stri
 }
 
 /**
+ * The same distances as commitDistances, but the walk stops at `maxDistance`: commits farther
+ * out are absent from the map, and distances up to it are exactly commitDistances' (BFS layers
+ * are shortest-first, so cutting the walk short changes nothing it records). A shallow fetch
+ * only ever needs the first few generations, and this keeps it from walking a whole history.
+ */
+export function commitDistancesWithin(forge: Forge, tips: readonly string[], maxDistance: number): Map<string, number> {
+  const distance = new Map<string, number>();
+  if (maxDistance < 0) return distance;
+  let frontier = [...tips];
+  for (const tip of frontier) if (!distance.has(tip)) distance.set(tip, 0);
+  let depth = 0;
+  while (frontier.length > 0 && depth < maxDistance) {
+    const next: string[] = [];
+    for (const commit of frontier) {
+      for (const parent of commitParents(forge, commit)) {
+        if (!distance.has(parent)) {
+          distance.set(parent, depth + 1);
+          next.push(parent);
+        }
+      }
+    }
+    frontier = next;
+    depth += 1;
+  }
+  return distance;
+}
+
+/**
  * Every object (commit, tree, blob, tag) reachable from the given commit set. When `limit` is
  * given, the parent walk stays inside it: commits outside the limit contribute nothing, which is
  * what a shallow fetch (and a shallow client's have-set) means.
@@ -520,6 +548,37 @@ export function diffFileMaps(
 const TYPE_CODES: Record<GitObjectType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
 const CODE_TYPES: Record<number, GitObjectType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
 
+/**
+ * The deflated pack entry (object header + compressed data) per object id. Objects are
+ * content-addressed and never mutated, so an entry once built stays correct for the life of
+ * the process; repeat fetches of the same history then cost a concat and a checksum, not a
+ * second compression of every object. Cleared whole when it outgrows its cap.
+ */
+const packEntryCache = new Map<string, Buffer>();
+const PACK_ENTRY_CACHE_MAX = 16_384;
+
+function packEntry(oid: string, object: GitObject): Buffer {
+  const cached = packEntryCache.get(oid);
+  if (cached !== undefined) return cached;
+  const code = TYPE_CODES[object.type];
+  const size = object.data.length;
+  const bytes: number[] = [];
+  let first = (code << 4) | (size & 0x0f);
+  let rest = Math.floor(size / 16);
+  if (rest > 0) first |= 0x80;
+  bytes.push(first);
+  while (rest > 0) {
+    let byte = rest & 0x7f;
+    rest = Math.floor(rest / 128);
+    if (rest > 0) byte |= 0x80;
+    bytes.push(byte);
+  }
+  const entry = Buffer.concat([Buffer.from(bytes), deflateSync(object.data)]);
+  if (packEntryCache.size >= PACK_ENTRY_CACHE_MAX) packEntryCache.clear();
+  packEntryCache.set(oid, entry);
+  return entry;
+}
+
 /** Write a version-2 pack holding the given objects, plain (no deltas). */
 export function writePack(forge: Forge, oids: readonly string[]): Buffer {
   const parts: Buffer[] = [];
@@ -531,21 +590,7 @@ export function writePack(forge: Forge, oids: readonly string[]): Buffer {
   for (const oid of oids) {
     const object = forge.getObject(oid);
     if (object === undefined) continue;
-    const code = TYPE_CODES[object.type];
-    const size = object.data.length;
-    const bytes: number[] = [];
-    let first = (code << 4) | (size & 0x0f);
-    let rest = Math.floor(size / 16);
-    if (rest > 0) first |= 0x80;
-    bytes.push(first);
-    while (rest > 0) {
-      let byte = rest & 0x7f;
-      rest = Math.floor(rest / 128);
-      if (rest > 0) byte |= 0x80;
-      bytes.push(byte);
-    }
-    parts.push(Buffer.from(bytes));
-    parts.push(deflateSync(object.data));
+    parts.push(packEntry(oid, object));
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
